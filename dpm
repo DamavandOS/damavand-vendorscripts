@@ -1,0 +1,1172 @@
+#!/usr/bin/env bash
+#
+# DPM - Download & Install
+# Core package download/install engine
+#
+
+set -Eeuo pipefail
+
+DPM_ROOT="${DPM_ROOT:-$HOME/.dpm}"
+
+CONFIG_DIR="$DPM_ROOT/config"
+MIRROR_FILE="$CONFIG_DIR/mirrors"
+
+CACHE_DIR="$DPM_ROOT/cache"
+PKG_CACHE="$CACHE_DIR/packages"
+MANIFEST_CACHE="$CACHE_DIR/manifests"
+
+APP_DIR="$DPM_ROOT/apps"
+SHORTCUT_DIR="$DPM_ROOT/shortcuts"
+DB_DIR="$DPM_ROOT/db"
+STATE_DIR="$DPM_ROOT/state"
+
+TMP_DIR="$DPM_ROOT/tmp"
+
+mkdir -p \
+    "$CONFIG_DIR" \
+    "$PKG_CACHE" \
+    "$MANIFEST_CACHE" \
+    "$APP_DIR" \
+    "$SHORTCUT_DIR" \
+    "$DB_DIR" \
+    "$STATE_DIR" \
+    "$TMP_DIR"
+
+
+# ------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------
+
+info() {
+    printf '\033[1;34m[dpm]\033[0m %s\n' "$*" >&2
+}
+
+success() {
+    printf '\033[1;32m[dpm]\033[0m %s\n' "$*" >&2
+}
+
+warn() {
+    printf '\033[1;33m[dpm]\033[0m %s\n' "$*" >&2
+}
+
+error() {
+    printf '\033[1;31m[dpm]\033[0m %s\n' "$*" >&2
+}
+
+die() {
+    error "$*"
+    exit 1
+}
+
+
+# ------------------------------------------------------------
+# User prompts
+# ------------------------------------------------------------
+
+confirm() {
+    local prompt="$1"
+    local default="${2:-n}"
+
+    local suffix
+    if [[ "$default" == "y" ]]; then
+        suffix="[Y/n]"
+    else
+        suffix="[y/N]"
+    fi
+
+    read -rp "$prompt $suffix: " -n 1 -r
+    echo
+
+    if [[ -z "$REPLY" ]]; then
+        REPLY="$default"
+    fi
+
+    [[ "$REPLY" =~ ^[Yy]$ ]]
+}
+
+
+# ------------------------------------------------------------
+# Requirements
+# ------------------------------------------------------------
+
+require_commands() {
+    local cmd
+
+    for cmd in curl zstd sha256sum awk sed grep sort mktemp; do
+        command -v "$cmd" >/dev/null 2>&1 ||
+            die "Required command not found: $cmd"
+    done
+}
+
+require_commands
+
+
+# ------------------------------------------------------------
+# Mirror handling
+# ------------------------------------------------------------
+
+load_mirrors() {
+    MIRRORS=()
+
+    [[ -f "$MIRROR_FILE" ]] ||
+        die "Mirror list not found: $MIRROR_FILE"
+
+    while IFS= read -r mirror || [[ -n "$mirror" ]]; do
+        # Remove CR
+        mirror="${mirror%$'\r'}"
+
+        # Skip empty lines
+        [[ -z "$mirror" ]] && continue
+
+        # Skip comments
+        [[ "$mirror" == \#* ]] && continue
+
+        # Require HTTP(S)
+        [[ "$mirror" =~ ^https?:// ]] || {
+            warn "Ignoring invalid mirror: $mirror"
+            continue
+        }
+
+        mirror="${mirror%/}"
+
+        MIRRORS+=("$mirror")
+    done < "$MIRROR_FILE"
+
+    ((${#MIRRORS[@]} > 0)) ||
+        die "No valid mirrors configured."
+}
+
+
+# ------------------------------------------------------------
+# HTTP download
+# ------------------------------------------------------------
+
+download_file() {
+    local url="$1"
+    local output="$2"
+
+    mkdir -p "$(dirname "$output")"
+
+    info "Downloading: $url"
+
+    if ! confirm "Download $url?"; then
+        die "Download cancelled by user."
+    fi
+
+    # -C - = resume partial download, --progress-bar = simple progress bar
+    if curl \
+        --fail \
+        --location \
+        --continue-at - \
+        --retry 3 \
+        --retry-delay 2 \
+        --connect-timeout 10 \
+        --max-time 0 \
+        --progress-bar \
+        --output "$output" \
+        "$url"; then
+        return 0
+    fi
+
+    # Server may not support resume.
+    warn "Resume failed; retrying full download..."
+
+    rm -f "$output"
+
+    curl \
+        --fail \
+        --location \
+        --retry 3 \
+        --retry-delay 2 \
+        --connect-timeout 10 \
+        --max-time 0 \
+        --progress-bar \
+        --output "$output" \
+        "$url"
+}
+
+
+# ------------------------------------------------------------
+# Manifest parser
+#
+# Supported:
+#
+# Name="SSH"
+# Version="1.0.0"
+# Description="..."
+# Depends=[
+# networkmanager,
+# foopkg,
+# barpkg
+# ]
+# Resolves=[
+# openssh
+# ]
+#
+# Optional:
+#
+# SHA256="..."
+# ------------------------------------------------------------
+
+manifest_get_scalar() {
+    local manifest="$1"
+    local key="$2"
+
+    awk -v key="$key" '
+        $0 ~ "^" key "=" {
+            line=$0
+            sub("^" key "=", "", line)
+            gsub(/^"/, "", line)
+            gsub(/"$/, "", line)
+            print line
+            exit
+        }
+    ' "$manifest"
+}
+
+
+manifest_get_list() {
+    local manifest="$1"
+    local key="$2"
+
+    awk -v key="$key" '
+        BEGIN {
+            inside=0
+        }
+
+        $0 ~ "^" key "=\\[" {
+            inside=1
+            next
+        }
+
+        inside && /^\]/ {
+            exit
+        }
+
+        inside {
+            line=$0
+
+            gsub(/^[[:space:]]+/, "", line)
+            gsub(/[[:space:]]+$/, "", line)
+            gsub(/,$/, "", line)
+            gsub(/^"/, "", line)
+            gsub(/"$/, "", line)
+
+            if (line != "")
+                print line
+        }
+    ' "$manifest"
+}
+
+
+validate_manifest() {
+    local manifest="$1"
+
+    [[ -s "$manifest" ]] ||
+        die "Manifest is empty."
+
+    local name version description
+
+    name="$(manifest_get_scalar "$manifest" "Name")"
+    version="$(manifest_get_scalar "$manifest" "Version")"
+    description="$(manifest_get_scalar "$manifest" "Description")"
+
+    [[ -n "$name" ]] ||
+        die "Manifest is invalid: missing Name"
+
+    [[ -n "$version" ]] ||
+        die "Manifest is invalid: missing Version"
+
+    [[ -n "$description" ]] ||
+        die "Manifest is invalid: missing Description"
+
+    grep -q '^Depends=\[' "$manifest" ||
+        die "Manifest is invalid: missing Depends"
+
+    grep -q '^Resolves=\[' "$manifest" ||
+        die "Manifest is invalid: missing Resolves"
+}
+
+
+# ------------------------------------------------------------
+# Manifest retrieval
+# ------------------------------------------------------------
+
+fetch_manifest() {
+    local package="$1"
+    local output="$MANIFEST_CACHE/$package.manifest"
+
+    load_mirrors
+
+    local mirror url tmp
+
+    tmp="$(mktemp "$TMP_DIR/manifest.XXXXXX")"
+
+    for mirror in "${MIRRORS[@]}"; do
+        url="$mirror/$package.manifest"
+
+        info "Trying mirror: $mirror"
+
+        if download_file "$url" "$tmp"; then
+            if validate_manifest "$tmp" 2>/dev/null; then
+                mv -f "$tmp" "$output"
+                printf '%s\n' "$output"
+                return 0
+            fi
+
+            warn "Invalid manifest from $mirror"
+        fi
+    done
+
+    rm -f "$tmp"
+
+    die "Could not obtain valid manifest for package: $package"
+}
+
+# ------------------------------------------------------------
+# Package download
+# ------------------------------------------------------------
+
+fetch_package() {
+    local package="$1"
+    local output="$PKG_CACHE/$package.pkg"
+
+    load_mirrors
+
+    if [[ -s "$output" ]]; then
+        printf '%s\n' "$output"
+        return 0
+    fi
+
+    local mirror url tmp
+
+    tmp="$(mktemp "$TMP_DIR/package.XXXXXX")"
+    rm -f "$tmp"
+
+    for mirror in "${MIRRORS[@]}"; do
+        url="$mirror/$package.pkg"
+
+        info "Trying package mirror: $mirror"
+
+        if download_file "$url" "$tmp"; then
+            mv -f "$tmp" "$output"
+            printf '%s\n' "$output"
+            return 0
+        fi
+    done
+
+    rm -f "$tmp"
+
+    die "Could not download package: $package"
+}
+
+
+# ------------------------------------------------------------
+# Optional SHA256 verification
+# ------------------------------------------------------------
+
+verify_package() {
+    local package="$1"
+    local manifest="$2"
+    local pkg="$3"
+
+    local expected
+
+    expected="$(manifest_get_scalar "$manifest" "SHA256" || true)"
+
+    [[ -z "$expected" ]] && return 0
+
+    info "Verifying SHA256: $package"
+
+    local actual
+    actual="$(sha256sum "$pkg" | awk '{print $1}')"
+
+    [[ "$actual" == "$expected" ]] ||
+        die "SHA256 verification failed for $package"
+
+    success "SHA256 OK: $package"
+}
+
+
+# ------------------------------------------------------------
+# Installed package database
+# ------------------------------------------------------------
+
+is_installed() {
+    local package="$1"
+
+    [[ -f "$DB_DIR/$package/manifest" ]]
+}
+
+
+installed_version() {
+    local package="$1"
+
+    if is_installed "$package"; then
+        manifest_get_scalar "$DB_DIR/$package/manifest" "Version"
+    fi
+}
+
+
+save_package_metadata() {
+    local package="$1"
+    local manifest="$2"
+    local workdir="${3:-}"
+
+    local dir="$DB_DIR/$package"
+
+    mkdir -p "$dir"
+
+    cp -f "$manifest" "$dir/manifest"
+
+    date -u +"%Y-%m-%dT%H:%M:%SZ" \
+        > "$dir/installed-at"
+
+    # Copy package scripts if workdir is provided.
+    if [[ -n "$workdir" && -d "$workdir" ]]; then
+        for script in preinstall.sh postinstall.sh preupgrade.sh postupgrade.sh preuninstall.sh postuninstall.sh uninstall.sh; do
+            if [[ -f "$workdir/$script" ]]; then
+                cp -f "$workdir/$script" "$dir/$script"
+            fi
+        done
+    fi
+}
+
+
+# ------------------------------------------------------------
+# Dependency tree
+# ------------------------------------------------------------
+
+declare -A RESOLVED
+declare -A VISITING
+
+
+resolve_dependency_tree() {
+    local package="$1"
+
+    [[ -n "${RESOLVED[$package]:-}" ]] && return 0
+
+    if [[ -n "${VISITING[$package]:-}" ]]; then
+        die "Circular dependency detected involving: $package"
+    fi
+
+    VISITING["$package"]=1
+
+    local manifest dep
+
+    manifest="$(fetch_manifest "$package")"
+
+    while IFS= read -r dep; do
+        [[ -z "$dep" ]] && continue
+
+        info "Dependency: $package -> $dep"
+
+        resolve_dependency_tree "$dep"
+    done < <(manifest_get_list "$manifest" "Depends")
+
+    unset 'VISITING[$package]'
+
+    RESOLVED["$package"]=1
+
+    INSTALL_ORDER+=("$package")
+}
+
+
+build_dependency_tree() {
+    INSTALL_ORDER=()
+    RESOLVED=()
+    VISITING=()
+
+    info "Building dependency tree..."
+
+    resolve_dependency_tree "$1"
+
+    echo
+    info "Install order:"
+
+    local pkg
+    for pkg in "${INSTALL_ORDER[@]}"; do
+        printf '  -> %s\n' "$pkg"
+    done
+}
+
+
+# ------------------------------------------------------------
+# Package extraction
+# ------------------------------------------------------------
+
+extract_package() {
+    local package="$1"
+    local pkg="$2"
+    local destination="$3"
+
+    mkdir -p "$destination"
+
+    info "Extracting $package..."
+
+    zstd -d --stdout "$pkg" | tar -xpf - -C "$destination"
+}
+
+
+# ------------------------------------------------------------
+# Shortcut
+# ------------------------------------------------------------
+
+create_shortcut() {
+    local package="$1"
+
+    local shortcut="$SHORTCUT_DIR/$package"
+    local image="$APP_DIR/$package.img"
+
+    cat > "$shortcut" <<EOF
+#!/usr/bin/env bash
+exec dpm-run "$image" "\$@"
+EOF
+
+    chmod +x "$shortcut"
+}
+
+
+remove_shortcut() {
+    local package="$1"
+
+    rm -f "$SHORTCUT_DIR/$package"
+}
+
+
+# ------------------------------------------------------------
+# Run package scripts
+# ------------------------------------------------------------
+
+run_install_script() {
+    local script="$1"
+    local package="$2"
+    local root="$3"
+
+    [[ -f "$script" ]] || return 0
+
+    info "Running preinstall for $package"
+
+    (
+        cd "$root"
+        export DPM_PACKAGE="$package"
+        export DPM_ROOT="$root"
+
+        bash "$script"
+    )
+}
+
+
+run_postinstall_script() {
+    local script="$1"
+    local package="$2"
+    local root="$3"
+
+    [[ -f "$script" ]] || return 0
+
+    info "Running postinstall for $package"
+
+    (
+        cd "$root"
+        export DPM_PACKAGE="$package"
+        export DPM_ROOT="$root"
+
+        bash "$script"
+    )
+}
+
+
+run_uninstall_script() {
+    local script="$1"
+    local package="$2"
+    local root="$3"
+
+    [[ -f "$script" ]] || return 0
+
+    info "Running uninstall script for $package"
+
+    (
+        cd "$root"
+        export DPM_PACKAGE="$package"
+        export DPM_ROOT="$root"
+
+        bash "$script"
+    )
+}
+
+
+run_preupgrade_script() {
+    local script="$1"
+    local package="$2"
+    local root="$3"
+    local old_version="$4"
+    local new_version="$5"
+
+    [[ -f "$script" ]] || return 0
+
+    info "Running preupgrade for $package ($old_version -> $new_version)"
+
+    (
+        cd "$root"
+        export DPM_PACKAGE="$package"
+        export DPM_ROOT="$root"
+        export DPM_OLD_VERSION="$old_version"
+        export DPM_NEW_VERSION="$new_version"
+
+        bash "$script"
+    )
+}
+
+
+run_postupgrade_script() {
+    local script="$1"
+    local package="$2"
+    local root="$3"
+    local old_version="$4"
+    local new_version="$5"
+
+    [[ -f "$script" ]] || return 0
+
+    info "Running postupgrade for $package ($old_version -> $new_version)"
+
+    (
+        cd "$root"
+        export DPM_PACKAGE="$package"
+        export DPM_ROOT="$root"
+        export DPM_OLD_VERSION="$old_version"
+        export DPM_NEW_VERSION="$new_version"
+
+        bash "$script"
+    )
+}
+
+
+run_preuninstall_script() {
+    local script="$1"
+    local package="$2"
+    local root="$3"
+    local version="$4"
+
+    [[ -f "$script" ]] || return 0
+
+    info "Running preuninstall for $package ($version)"
+
+    (
+        cd "$root"
+        export DPM_PACKAGE="$package"
+        export DPM_ROOT="$root"
+        export DPM_VERSION="$version"
+
+        bash "$script"
+    )
+}
+
+
+run_postuninstall_script() {
+    local script="$1"
+    local package="$2"
+    local root="$3"
+    local version="$4"
+
+    [[ -f "$script" ]] || return 0
+
+    info "Running postuninstall for $package ($version)"
+
+    (
+        cd "$root"
+        export DPM_PACKAGE="$package"
+        export DPM_ROOT="$root"
+        export DPM_VERSION="$version"
+
+        bash "$script"
+    )
+}
+
+
+check_script_with_prompt() {
+    local script="$1"
+    local script_type="$2"
+    local package="$3"
+
+    if [[ ! -f "$script" ]]; then
+        warn "No $script_type script found for $package"
+
+        if ! confirm "Continue without $script_type script?"; then
+            die "Installation cancelled by user."
+        fi
+
+        return 1
+    fi
+
+    return 0
+}
+
+
+# ------------------------------------------------------------
+# Install one package
+# ------------------------------------------------------------
+
+install_one() {
+    local package="$1"
+
+    local manifest
+    manifest="$(fetch_manifest "$package")"
+
+    local name version
+
+    name="$(manifest_get_scalar "$manifest" "Name")"
+    version="$(manifest_get_scalar "$manifest" "Version")"
+
+    info "Installing $name $version"
+
+    local current_version=""
+
+    if is_installed "$package"; then
+        current_version="$(installed_version "$package")"
+
+        if [[ "$current_version" == "$version" ]]; then
+            info "$package $version is already installed."
+            return 0
+        fi
+
+        info "Upgrading $package $current_version -> $version"
+
+        if ! confirm "Upgrade $package from $current_version to $version?"; then
+            info "Upgrade cancelled."
+            return 0
+        fi
+
+        # Package version changed, invalidate cached package.
+        rm -f "$PKG_CACHE/$package.pkg"
+
+        local pkg
+        pkg="$(fetch_package "$package")"
+
+        verify_package "$package" "$manifest" "$pkg"
+
+        local workdir
+        workdir="$(mktemp -d "$TMP_DIR/install.XXXXXX")"
+
+        trap 'rm -rf "${workdir:-}"' RETURN
+
+        extract_package "$package" "$pkg" "$workdir"
+
+        local image_source=""
+
+        if [[ -f "$workdir/app.img" ]]; then
+            image_source="$workdir/app.img"
+        elif [[ -f "$workdir/$package.img" ]]; then
+            image_source="$workdir/$package.img"
+        else
+            die "$package.pkg does not contain app.img or $package.img"
+        fi
+
+        # Run preupgrade before replacing the application image.
+        check_script_with_prompt "$workdir/preupgrade.sh" "preupgrade" "$package"
+        run_preupgrade_script \
+            "$workdir/preupgrade.sh" \
+            "$package" \
+            "$workdir" \
+            "$current_version" \
+            "$version"
+
+        local target="$APP_DIR/$package.img"
+        local new_image="$APP_DIR/.$package.img.new"
+
+        cp -f "$image_source" "$new_image"
+
+        # Atomic replacement.
+        mv -f "$new_image" "$target"
+
+        # Copy extra etc data if provided.
+        if [[ -d "$workdir/etc" ]]; then
+            mkdir -p "$DPM_ROOT/etc/$package"
+            cp -a "$workdir/etc/." "$DPM_ROOT/etc/$package/"
+        fi
+
+        # Save metadata.
+        save_package_metadata "$package" "$manifest" "$workdir"
+
+        create_shortcut "$package"
+
+        check_script_with_prompt "$workdir/postupgrade.sh" "postupgrade" "$package"
+        run_postupgrade_script \
+            "$workdir/postupgrade.sh" \
+            "$package" \
+            "$workdir" \
+            "$current_version" \
+            "$version"
+
+        success "$package $version upgraded."
+    else
+        if ! confirm "Install $package $version?"; then
+            info "Install cancelled."
+            return 0
+        fi
+
+        local pkg
+        pkg="$(fetch_package "$package")"
+
+        verify_package "$package" "$manifest" "$pkg"
+
+        local workdir
+        workdir="$(mktemp -d "$TMP_DIR/install.XXXXXX")"
+
+        trap 'rm -rf "${workdir:-}"' RETURN
+
+        extract_package "$package" "$pkg" "$workdir"
+
+        local image_source=""
+
+        if [[ -f "$workdir/app.img" ]]; then
+            image_source="$workdir/app.img"
+        elif [[ -f "$workdir/$package.img" ]]; then
+            image_source="$workdir/$package.img"
+        else
+            die "$package.pkg does not contain app.img or $package.img"
+        fi
+
+        # Run preinstall before replacing the application image.
+        check_script_with_prompt "$workdir/preinstall.sh" "preinstall" "$package"
+        run_install_script \
+            "$workdir/preinstall.sh" \
+            "$package" \
+            "$workdir"
+
+        local target="$APP_DIR/$package.img"
+        local new_image="$APP_DIR/.$package.img.new"
+
+        cp -f "$image_source" "$new_image"
+
+        # Atomic replacement.
+        mv -f "$new_image" "$target"
+
+        # Copy extra etc data if provided.
+        if [[ -d "$workdir/etc" ]]; then
+            mkdir -p "$DPM_ROOT/etc/$package"
+            cp -a "$workdir/etc/." "$DPM_ROOT/etc/$package/"
+        fi
+
+        # Save metadata.
+        save_package_metadata "$package" "$manifest" "$workdir"
+
+        create_shortcut "$package"
+
+        check_script_with_prompt "$workdir/postinstall.sh" "postinstall" "$package"
+        run_postinstall_script \
+            "$workdir/postinstall.sh" \
+            "$package" \
+            "$workdir"
+
+        success "$package $version installed."
+    fi
+}
+
+
+# ------------------------------------------------------------
+# Install
+# ------------------------------------------------------------
+
+install_package() {
+    local package="$1"
+
+    [[ -n "$package" ]] ||
+        die "No package specified."
+
+    build_dependency_tree "$package"
+
+    local pkg
+
+    for pkg in "${INSTALL_ORDER[@]}"; do
+        install_one "$pkg"
+    done
+}
+
+
+# ------------------------------------------------------------
+# Uninstall
+# ------------------------------------------------------------
+
+uninstall_package() {
+    local package="$1"
+
+    is_installed "$package" ||
+        die "$package is not installed."
+
+    local manifest="$DB_DIR/$package/manifest"
+    local version
+
+    version="$(manifest_get_scalar "$manifest" "Version")"
+
+    if ! confirm "Uninstall $package $version?"; then
+        info "Uninstall cancelled."
+        return 0
+    fi
+
+    info "Uninstalling $package..."
+
+    # Run preuninstall script from installed package metadata.
+    local preuninstall_script="$DB_DIR/$package/preuninstall.sh"
+    check_script_with_prompt "$preuninstall_script" "preuninstall" "$package"
+    run_preuninstall_script \
+        "$preuninstall_script" \
+        "$package" \
+        "$DB_DIR/$package" \
+        "$version"
+
+    # Run uninstall script from installed package metadata.
+    local uninstall_script="$DB_DIR/$package/uninstall.sh"
+    check_script_with_prompt "$uninstall_script" "uninstall" "$package"
+    run_uninstall_script \
+        "$uninstall_script" \
+        "$package" \
+        "$DB_DIR/$package"
+
+    # Run postuninstall script before cleanup.
+    local postuninstall_script="$DB_DIR/$package/postuninstall.sh"
+    check_script_with_prompt "$postuninstall_script" "postuninstall" "$package"
+    run_postuninstall_script \
+        "$postuninstall_script" \
+        "$package" \
+        "$DB_DIR/$package" \
+        "$version"
+
+    rm -f "$APP_DIR/$package.img"
+    remove_shortcut "$package"
+
+    rm -rf "$DPM_ROOT/etc/$package"
+    rm -rf "$DB_DIR/$package"
+
+    success "$package $version uninstalled."
+}
+
+
+# ------------------------------------------------------------
+# Upgrade
+# ------------------------------------------------------------
+
+upgrade_package() {
+    local package="$1"
+
+    is_installed "$package" ||
+        die "$package is not installed."
+
+    local old_manifest="$DB_DIR/$package/manifest"
+    local old_version
+
+    old_version="$(manifest_get_scalar "$old_manifest" "Version")"
+
+    local new_manifest
+    new_manifest="$(fetch_manifest "$package")"
+
+    local new_version
+    new_version="$(manifest_get_scalar "$new_manifest" "Version")"
+
+    if [[ "$old_version" == "$new_version" ]]; then
+        info "$package is already up to date ($old_version)."
+        return 0
+    fi
+
+    info "Upgrade available: $package $old_version -> $new_version"
+
+    install_package "$package"
+}
+
+
+# ------------------------------------------------------------
+# Update all packages
+# ------------------------------------------------------------
+
+update_all() {
+    info "Checking for updates..."
+
+    local packages=()
+    local pkg
+
+    for pkg in "$DB_DIR"/*/; do
+        [[ -d "$pkg" ]] || continue
+        pkg="${pkg%/}"
+        pkg="${pkg##*/}"
+        packages+=("$pkg")
+    done
+
+    if ((${#packages[@]} == 0)); then
+        info "No packages installed."
+        return 0
+    fi
+
+    local updates=()
+    local pkg name old_version new_version
+
+    for pkg in "${packages[@]}"; do
+        local old_manifest="$DB_DIR/$pkg/manifest"
+        old_version="$(manifest_get_scalar "$old_manifest" "Version")"
+
+        local new_manifest
+        new_manifest="$(fetch_manifest "$pkg" 2>/dev/null || true)"
+
+        if [[ -z "$new_manifest" || ! -s "$new_manifest" ]]; then
+            warn "Could not fetch manifest for $pkg"
+            continue
+        fi
+
+        new_version="$(manifest_get_scalar "$new_manifest" "Version")"
+
+        if [[ "$old_version" != "$new_version" ]]; then
+            name="$(manifest_get_scalar "$new_manifest" "Name")"
+            updates+=("$pkg $old_version -> $new_version")
+            info "Update available: $name $old_version -> $new_version"
+        fi
+    done
+
+    if ((${#updates[@]} == 0)); then
+        success "All packages are up to date."
+        return 0
+    fi
+
+    echo
+    info "The following packages will be upgraded:"
+    for u in "${updates[@]}"; do
+        printf '  %s\n' "$u"
+    done
+    echo
+
+    if ! confirm "Proceed with upgrading all packages?"; then
+        info "Update cancelled."
+        return 0
+    fi
+
+    for pkg in "${packages[@]}"; do
+        local old_manifest="$DB_DIR/$pkg/manifest"
+        old_version="$(manifest_get_scalar "$old_manifest" "Version")"
+
+        local new_manifest
+        new_manifest="$(fetch_manifest "$pkg" 2>/dev/null || true)"
+
+        if [[ -z "$new_manifest" || ! -s "$new_manifest" ]]; then
+            continue
+        fi
+
+        new_version="$(manifest_get_scalar "$new_manifest" "Version")"
+
+        if [[ "$old_version" != "$new_version" ]]; then
+            install_package "$pkg"
+        fi
+    done
+
+    success "Update complete."
+}
+
+
+# ------------------------------------------------------------
+# Clean caches
+# ------------------------------------------------------------
+
+clean_cache() {
+    info "Cleaning DPM caches..."
+
+    local cache_dirs=(
+        "$PKG_CACHE"
+        "$MANIFEST_CACHE"
+        "$TMP_DIR"
+    )
+
+    local total_freed=0
+
+    for dir in "${cache_dirs[@]}"; do
+        if [[ -d "$dir" ]]; then
+            local size_before
+            size_before=$(du -sk "$dir" 2>/dev/null | awk '{print $1}' || echo 0)
+            rm -rf "$dir"/*
+            local size_after
+            size_after=$(du -sk "$dir" 2>/dev/null | awk '{print $1}' || echo 0)
+            local freed=$((size_before - size_after))
+            total_freed=$((total_freed + freed))
+            if ((freed > 0)); then
+                info "Cleaned $dir: freed ${freed} KiB"
+            fi
+        fi
+    done
+
+    # Recreate directories
+    mkdir -p "$PKG_CACHE" "$MANIFEST_CACHE" "$TMP_DIR"
+
+    if ((total_freed > 0)); then
+        success "Clean complete. Freed ${total_freed} KiB"
+    else
+        info "Nothing to clean."
+    fi
+}
+
+
+# ------------------------------------------------------------
+# Main command dispatcher
+# ------------------------------------------------------------
+
+usage() {
+    cat <<EOF
+DPM - Damavand Package Manager
+
+Usage:
+    dpm install <package>     # Install new or upgrade existing package
+    dpm uninstall <package>   # Remove installed package
+    dpm update                # Check and upgrade all packages
+    dpm clean                 # Clean all caches
+
+Examples:
+    dpm install ssh
+    dpm uninstall ssh
+    dpm update
+    dpm clean
+EOF
+}
+
+
+main() {
+    local action="${1:-}"
+
+    case "$action" in
+        install)
+            [[ $# -eq 2 ]] || {
+                usage
+                exit 1
+            }
+
+            install_package "$2"
+            ;;
+
+        uninstall)
+            [[ $# -eq 2 ]] || {
+                usage
+                exit 1
+            }
+
+            uninstall_package "$2"
+            ;;
+
+        update)
+            update_all
+            ;;
+
+        clean)
+            clean_cache
+            ;;
+
+        upgrade)
+            warn "'upgrade' command is deprecated. Use 'install' instead."
+            [[ $# -eq 2 ]] || {
+                usage
+                exit 1
+            }
+
+            upgrade_package "$2"
+            ;;
+
+        *)
+            usage
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

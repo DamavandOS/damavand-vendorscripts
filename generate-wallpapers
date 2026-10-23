@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+
+from pathlib import Path
+from xml.etree.ElementTree import Element, SubElement, ElementTree
+from xml.dom import minidom
+
+WALLPAPER_DIR = Path("/usr/share/backgrounds/damavand")
+XML_DIR = Path("/usr/share/gnome-background-properties")
+XML_FILE = XML_DIR / "damavand-wallpapers.xml"
+
+EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+
+wallpapers = sorted(
+    file for file in WALLPAPER_DIR.iterdir()
+    if file.is_file() and file.suffix.lower() in EXTENSIONS
+)
+
+root = Element("wallpapers")
+
+for file in wallpapers:
+    wallpaper = SubElement(root, "wallpaper", {"deleted": "false"})
+
+    name = SubElement(wallpaper, "name")
+    name.text = file.stem.replace("_", " ").replace("-", " ").title()
+
+    filename = SubElement(wallpaper, "filename")
+    filename.text = str(file)
+
+    options = SubElement(wallpaper, "options")
+    options.text = "zoom"
+
+    shade = SubElement(wallpaper, "shade_type")
+    shade.text = "solid"
+
+    pcolor = SubElement(wallpaper, "pcolor")
+    pcolor.text = "#202020"
+
+    scolor = SubElement(wallpaper, "scolor")
+    scolor.text = "#000000"
+
+XML_DIR.mkdir(parents=True, exist_ok=True)
+
+xml_bytes = minidom.parseString(
+    __import__("xml.etree.ElementTree", fromlist=["t"]).tostring(root)
+).toprettyxml(indent="  ", encoding="UTF-8")
+
+XML_FILE.write_bytes(xml_bytes)
+
+print(f"Generated {XML_FILE}")
+print(f"Found {len(wallpapers)} wallpapers.")

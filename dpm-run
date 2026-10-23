@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Usage:
+#   ./run.sh PROGRAM.img [arguments...]
+
+IMAGE="${1:-}"
+
+if [[ -z "$IMAGE" ]]; then
+    echo "Usage: $0 PROGRAM.img [arguments...]"
+    exit 1
+fi
+
+if [[ ! -f "$IMAGE" ]]; then
+    echo "Error: image not found: $IMAGE"
+    exit 1
+fi
+
+if ! command -v fuse2fs >/dev/null; then
+    echo "Error: fuse2fs is required."
+    echo "Install e2fsprogs."
+    exit 1
+fi
+
+IMAGE="$(realpath "$IMAGE")"
+
+MOUNT="$(mktemp -d)"
+
+cleanup() {
+    fusermount3 -u "$MOUNT" 2>/dev/null || \
+    fusermount -u "$MOUNT" 2>/dev/null || \
+    umount "$MOUNT" 2>/dev/null || true
+
+    rmdir "$MOUNT" 2>/dev/null || true
+}
+
+trap cleanup EXIT INT TERM
+
+fuse2fs "$IMAGE" "$MOUNT" >/dev/null 2>&1
+
+# Read application metadata
+CONFIG="$MOUNT/etc/appimage.conf"
+
+if [[ ! -f "$CONFIG" ]]; then
+    echo "Error: app metadata not found:"
+    echo "  $CONFIG"
+    exit 1
+fi
+
+# shellcheck disable=SC1090
+source "$CONFIG"
+
+if [[ -z "${APP_NAME:-}" ]]; then
+    echo "Error: APP_NAME is missing from appimage.conf"
+    exit 1
+fi
+
+APP="$MOUNT/bin/$APP_NAME"
+
+if [[ ! -x "$APP" ]]; then
+    echo "Error: executable not found:"
+    echo "  $APP"
+    echo
+    echo "Contents of /bin:"
+    ls -la "$MOUNT/bin"
+    exit 1
+fi
+
+# Libraries inside the image
+# export LD_LIBRARY_PATH="$MOUNT/lib:$MOUNT/lib64:$MOUNT/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+export LD_LIBRARY_PATH="$MOUNT/lib:$MOUNT/lib64:$MOUNT/usr/lib"
+unset LD_PRELOAD
+
+# Some programs expect HOME
+export HOME="${HOME:-/tmp}"
+
+# Execute directly from FUSE filesystem.
+"$APP" "${@:2}"
+
+STATUS=$?
+
+exit "$STATUS"

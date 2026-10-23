@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+DB="/var/lib/damavand-updater/installed"
+LOCK="/run/lock/damavand-updater.lock"
+
+die() {
+    printf 'Damavand Update Error: %s\n' "$*" >&2
+    exit 1
+}
+
+if (( EUID != 0 )); then
+    printf 'Please run as root: pkexec %q <package.dup>\n' "$0" >&2
+    exit 1
+fi
+
+[[ $# -eq 1 ]] || die "Usage: damavand-update <package.dup>"
+
+for cmd in tar zstd jq flock realpath awk; do
+    command -v "$cmd" >/dev/null 2>&1 ||
+        die "Required command not found: $cmd"
+done
+
+PKG=$(realpath -e -- "$1") ||
+    die "Package file does not exist"
+
+[[ -f "$PKG" && -r "$PKG" ]] ||
+    die "Package must be a readable regular file"
+
+[[ "$PKG" == *.dup ]] ||
+    die "Expected a .dup package"
+
+mkdir -p "$DB" /run/lock
+chmod 700 "$DB"
+
+exec 9>"$LOCK"
+flock -n 9 || die "Another update is running"
+
+WORK=$(mktemp -d /tmp/damavand-update.XXXXXXXX)
+chmod 700 "$WORK"
+
+cleanup() {
+    rm -rf -- "$WORK"
+}
+trap cleanup EXIT
+
+echo "==> Inspecting package archive..."
+
+# Reject symlinks, hardlinks, devices and other special entries.
+tar --zstd -tvf "$PKG" > "$WORK/archive.verbose" ||
+    die "Invalid Zstandard tar archive"
+
+awk '
+    substr($0, 1, 1) != "-" &&
+    substr($0, 1, 1) != "d" { exit 1 }
+' "$WORK/archive.verbose" ||
+    die "Archive contains a non-regular file or directory"
+
+tar --zstd -tf "$PKG" > "$WORK/archive.list" ||
+    die "Could not list archive contents"
+
+# Reject absolute paths, traversal and unexpected top-level files.
+while IFS= read -r entry || [[ -n "$entry" ]]; do
+    while [[ "$entry" == ./* ]]; do
+        entry="${entry#./}"
+    done
+
+    case "$entry" in
+        ""|".") continue ;;
+        /*|..|../*|*/..|*/../*)
+            die "Unsafe archive path: $entry"
+            ;;
+        manifest.json|install.sh|data|data/*)
+            ;;
+        *)
+            die "Unexpected archive entry: $entry"
+            ;;
+    esac
+done < "$WORK/archive.list"
+
+echo "==> Extracting package..."
+
+tar --zstd \
+    --no-same-owner \
+    --no-same-permissions \
+    -xf "$PKG" -C "$WORK" ||
+    die "Extraction failed"
+
+[[ -f "$WORK/manifest.json" && ! -L "$WORK/manifest.json" ]] ||
+    die "manifest.json is missing or invalid"
+
+[[ -f "$WORK/install.sh" && ! -L "$WORK/install.sh" ]] ||
+    die "install.sh is missing or invalid"
+
+[[ -d "$WORK/data" && ! -L "$WORK/data" ]] ||
+    die "data/ directory is missing or invalid"
+
+MANIFEST="$WORK/manifest.json"
+
+jq -e '
+    (.id | type == "string") and
+    (.name | type == "string") and
+    (.version | type == "string") and
+    ((.depends // []) | type == "array" and
+        all(.[]; type == "string"))
+' "$MANIFEST" >/dev/null ||
+    die "Invalid manifest schema"
+
+ID=$(jq -r '.id' "$MANIFEST")
+NAME=$(jq -r '.name' "$MANIFEST")
+VERSION=$(jq -r '.version' "$MANIFEST")
+
+[[ "$ID" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] ||
+    die "Invalid package ID"
+
+# Check ID before installing anything.
+[[ ! -e "$DB/$ID.json" ]] ||
+    die "Package ID '$ID' is already installed"
+
+echo "==> Package: $NAME"
+echo "==> Version: $VERSION"
+echo "==> ID:      $ID"
+
+# Check dependencies before executing install.sh.
+while IFS= read -r dep; do
+    [[ "$dep" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]] ||
+        die "Invalid dependency ID in manifest"
+
+    [[ "$dep" != "$ID" ]] ||
+        die "Package cannot depend on itself"
+
+    [[ -f "$DB/$dep.json" && ! -L "$DB/$dep.json" ]] ||
+        die "Missing dependency '$dep'. Install it first."
+
+    echo "==> Dependency satisfied: $dep"
+done < <(jq -r '.depends // [] | .[]' "$MANIFEST")
+
+echo "==> Running installation script..."
+
+# install.sh runs as root, with data/ beside it.
+pushd "$WORK" >/dev/null
+
+if bash ./install.sh; then
+    popd >/dev/null
+else
+    status=$?
+    popd >/dev/null
+    die "Installation failed (exit code $status). Package ID was not recorded; changes may need manual repair."
+fi
+
+# Record the ID only after a successful installer exit.
+MARKER_TMP=$(mktemp "$DB/.record.XXXXXXXX")
+if ! cp -- "$MANIFEST" "$MARKER_TMP"; then
+    rm -f -- "$MARKER_TMP"
+    die "Installed, but could not prepare the package record"
+fi
+
+if ! mv -- "$MARKER_TMP" "$DB/$ID.json"; then
+    rm -f -- "$MARKER_TMP"
+    die "Installed, but failed to commit the package record"
+fi
+
+echo "==> Update installed successfully!"
+echo "==> Recorded ID: $ID"

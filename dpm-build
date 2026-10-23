@@ -1,0 +1,353 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ============================================================
+# Arch Linux App Image Builder
+#
+# Usage:
+#   ./build.sh PROGRAM [OUTPUT.img]
+#
+# Example:
+#   ./build.sh ./hello
+#   ./build.sh ./glxgears glxgears.img
+#
+# Requirements (Arch):
+#   gcc / binutils
+#   e2fsprogs
+#   patchelf
+# ============================================================
+
+PROGRAM="${1:-}"
+OUTPUT="${2:-}"
+
+if [[ -z "$PROGRAM" ]]; then
+    echo "Usage: $0 PROGRAM [OUTPUT.img]"
+    exit 1
+fi
+
+if [[ ! -f "$PROGRAM" ]]; then
+    echo "Error: program not found: $PROGRAM"
+    exit 1
+fi
+
+# ------------------------------------------------------------
+# Dependencies
+# ------------------------------------------------------------
+
+for cmd in \
+    readelf \
+    patchelf \
+    mke2fs \
+    du \
+    awk \
+    realpath \
+    truncate
+do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo "Error: '$cmd' is required"
+        exit 1
+    fi
+done
+
+# ------------------------------------------------------------
+# Absolute paths
+# ------------------------------------------------------------
+
+PROGRAM="$(realpath "$PROGRAM")"
+
+if [[ -z "$OUTPUT" ]]; then
+    OUTPUT="$(basename "$PROGRAM").img"
+fi
+
+OUTPUT="$(realpath -m "$OUTPUT")"
+
+# ------------------------------------------------------------
+# Temporary filesystem
+# ------------------------------------------------------------
+
+WORK="$(mktemp -d)"
+ROOT="$WORK/root"
+
+cleanup() {
+    rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+echo "[+] Preparing root filesystem..."
+
+mkdir -p \
+    "$ROOT/bin" \
+    "$ROOT/lib" \
+    "$ROOT/lib64" \
+    "$ROOT/usr/lib" \
+    "$ROOT/usr/bin" \
+    "$ROOT/etc" \
+    "$ROOT/tmp" \
+    "$ROOT/proc" \
+    "$ROOT/dev" \
+    "$ROOT/root" \
+    "$ROOT/var" \
+    "$ROOT/run"
+
+chmod 1777 "$ROOT/tmp"
+
+# ------------------------------------------------------------
+# Dependency tracking
+# ------------------------------------------------------------
+
+declare -A SEEN
+
+copy_file() {
+    local src="$1"
+    local dest="$ROOT$src"
+
+    [[ -e "$src" || -L "$src" ]] || return 0
+
+    mkdir -p "$(dirname "$dest")"
+
+    if [[ -L "$src" ]]; then
+        if [[ ! -e "$dest" && ! -L "$dest" ]]; then
+            cp -a "$src" "$dest"
+            echo "    + $src"
+        fi
+
+        local target
+        target="$(readlink "$src")"
+
+        if [[ "$target" = /* ]]; then
+            copy_file "$target"
+        else
+            copy_file "$(dirname "$src")/$target"
+        fi
+
+    elif [[ ! -e "$dest" ]]; then
+        cp -a "$src" "$dest"
+        echo "    + $src"
+    fi
+}
+
+# ------------------------------------------------------------
+# Recursive ELF dependency collector
+# ------------------------------------------------------------
+
+collect_deps() {
+    local elf="$1"
+
+    [[ -f "$elf" ]] || return 0
+
+    # Don't process the same ELF twice.
+    if [[ -n "${SEEN[$elf]+x}" ]]; then
+        return 0
+    fi
+
+    SEEN["$elf"]=1
+
+    echo "[+] Scanning: $elf"
+
+    # --------------------------------------------------------
+    # Dynamic interpreter
+    # --------------------------------------------------------
+
+    local interpreter
+
+    interpreter="$(patchelf --print-interpreter "$elf" 2>/dev/null || true)"
+
+    if [[ -n "$interpreter" && -f "$interpreter" ]]; then
+        copy_file "$interpreter"
+
+        # Scan interpreter's own dependencies too.
+        collect_deps "$interpreter"
+    fi
+
+    # --------------------------------------------------------
+    # DT_NEEDED
+    # --------------------------------------------------------
+
+    while read -r lib; do
+        [[ -z "$lib" ]] && continue
+
+        local resolved=""
+
+        # ----------------------------------------------------
+        # Arch Linux library locations
+        #
+        # ldconfig is not always the best source on Arch,
+        # therefore try the common Arch locations explicitly.
+        # ----------------------------------------------------
+
+        local candidates=(
+            "/usr/lib/$lib"
+            "/usr/lib64/$lib"
+            "/lib/$lib"
+            "/lib64/$lib"
+        )
+
+        for candidate in "${candidates[@]}"; do
+            if [[ -e "$candidate" ]]; then
+                resolved="$candidate"
+                break
+            fi
+        done
+
+        # ----------------------------------------------------
+        # Fallback: let ldconfig resolve it.
+        # ----------------------------------------------------
+
+        if [[ -z "$resolved" ]] && command -v ldconfig >/dev/null 2>&1; then
+            resolved="$(
+                ldconfig -p 2>/dev/null |
+                awk -v name="$lib" '
+                    $1 == name {
+                        print $NF
+                        exit
+                    }
+                '
+            )"
+        fi
+
+        if [[ -z "$resolved" || ! -e "$resolved" ]]; then
+            echo "    ! WARNING: could not resolve $lib"
+            continue
+        fi
+
+        resolved="$(realpath "$resolved")"
+
+        copy_file "$resolved"
+
+        # ----------------------------------------------------
+        # Recursive dependency scan
+        # ----------------------------------------------------
+
+        collect_deps "$resolved"
+
+    done < <(
+        readelf -d "$elf" 2>/dev/null |
+        awk -F'[][]' '/\(NEEDED\)/ {print $2}'
+    )
+}
+
+# ------------------------------------------------------------
+# Copy application
+# ------------------------------------------------------------
+
+APP_NAME="$(basename "$PROGRAM")"
+
+cat > "$ROOT/etc/appimage.conf" <<EOF
+APP_NAME=$APP_NAME
+EOF
+
+cp -a "$PROGRAM" "$ROOT/bin/$APP_NAME"
+chmod +x "$ROOT/bin/$APP_NAME"
+
+echo
+echo "[+] Collecting recursive dependencies..."
+echo
+
+collect_deps "$PROGRAM"
+
+# ------------------------------------------------------------
+# Patch application
+# ------------------------------------------------------------
+
+INTERPRETER="$(patchelf --print-interpreter "$PROGRAM" 2>/dev/null || true)"
+
+if [[ -n "$INTERPRETER" ]]; then
+
+    echo
+    echo "[+] Patching ELF..."
+
+    patchelf \
+        --set-interpreter "$INTERPRETER" \
+        --set-rpath '$ORIGIN/../lib:$ORIGIN/../lib64:$ORIGIN/../usr/lib' \
+        "$ROOT/bin/$APP_NAME"
+else
+    echo
+    echo "[!] Program appears to be statically linked."
+fi
+
+# ------------------------------------------------------------
+# Minimal Arch userspace files
+# ------------------------------------------------------------
+
+cat > "$ROOT/etc/hosts" <<'EOF'
+127.0.0.1 localhost
+::1 localhost
+EOF
+
+cat > "$ROOT/etc/passwd" <<'EOF'
+root:x:0:0:root:/root:/bin/sh
+EOF
+
+cat > "$ROOT/etc/group" <<'EOF'
+root:x:0:
+EOF
+
+# ------------------------------------------------------------
+# Calculate image size
+# ------------------------------------------------------------
+
+echo
+echo "[+] Calculating filesystem size..."
+
+# Actual filesystem contents in KiB.
+USED_KB="$(du -sk "$ROOT" | awk '{print $1}')"
+
+# ext4 filesystem overhead:
+# - superblocks
+# - inode tables
+# - journal
+# - block groups
+# - directory metadata
+# - alignment
+#
+# Keep at least 8 MiB of filesystem overhead.
+OVERHEAD_KB=$((USED_KB / 4))
+
+if (( OVERHEAD_KB < 8192 )); then
+    OVERHEAD_KB=8192
+fi
+
+SIZE_KB=$((USED_KB + OVERHEAD_KB))
+
+# Round up to 1 MiB.
+SIZE_KB=$(( (SIZE_KB + 1023) / 1024 * 1024 ))
+
+echo "    Used : $((USED_KB / 1024)) MiB"
+echo "    Free : $((OVERHEAD_KB / 1024)) MiB"
+echo "    Total: $((SIZE_KB / 1024)) MiB"
+
+# ------------------------------------------------------------
+# Create image
+# ------------------------------------------------------------
+
+rm -f "$OUTPUT"
+
+echo
+echo "[+] Creating ext4 image..."
+
+truncate -s "${SIZE_KB}K" "$OUTPUT"
+
+mke2fs \
+    -q \
+    -t ext4 \
+    -F \
+    -d "$ROOT" \
+    "$OUTPUT"
+
+# ------------------------------------------------------------
+# Final information
+# ------------------------------------------------------------
+
+echo
+echo "======================================"
+echo " Image created successfully!"
+echo "======================================"
+echo
+echo "Image   : $OUTPUT"
+echo "Format  : ext4"
+echo "Program : /bin/$APP_NAME"
+echo "Size    : $((SIZE_KB / 1024)) MiB"
+echo
+echo "Run with:"
+echo "  ./run.sh $OUTPUT"
+echo
